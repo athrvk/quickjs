@@ -8596,6 +8596,12 @@ static JSValue JS_ThrowTypeErrorNotAFunction(JSContext *ctx)
     return JS_ThrowTypeError(ctx, "not a function");
 }
 
+static no_inline void js_improve_not_a_function_error(JSContext *ctx,
+                                                      JSStackFrame *sf,
+                                                      JSFunctionBytecode *b,
+                                                      const uint8_t *pc,
+                                                      JSValueConst *call_argv);
+
 static JSValue JS_ThrowTypeErrorNotAnObject(JSContext *ctx)
 {
     return JS_ThrowTypeError(ctx, "not an object");
@@ -18576,8 +18582,10 @@ static JSValue JS_CallInternal(JSContext *caller_ctx, JSValueConst func_obj,
                 ret_val = JS_CallInternal(ctx, call_argv[-1], call_argv[-2],
                                           JS_UNDEFINED, call_argc,
                                           vc(call_argv), 0);
-                if (unlikely(JS_IsException(ret_val)))
+                if (unlikely(JS_IsException(ret_val))) {
+                    js_improve_not_a_function_error(ctx, sf, b, pc, call_argv);
                     goto exception;
+                }
                 if (opcode == OP_tail_call_method)
                     goto done;
                 for(i = -2; i < call_argc; i++)
@@ -36700,17 +36708,18 @@ static __exception int ss_check(JSContext *ctx, StackSizeState *s,
     return 0;
 }
 
+/* If 'pstack_level_tab' is not NULL, it receives the table of stack
+   depths at each instruction (0xffff = unreachable); the caller frees it. */
 static __exception int compute_stack_size(JSContext *ctx,
-                                          JSFunctionDef *fd,
-                                          int *pstack_size)
+                                          const uint8_t *bc_buf, int bc_len,
+                                          int *pstack_size,
+                                          uint16_t **pstack_level_tab)
 {
     StackSizeState s_s, *s = &s_s;
     int i, diff, n_pop, pos_next, stack_len, pos, op, catch_pos, catch_level;
     const JSOpCode *oi;
-    const uint8_t *bc_buf;
 
-    bc_buf = fd->byte_code.buf;
-    s->bc_len = fd->byte_code.size;
+    s->bc_len = bc_len;
     /* bc_len > 0 */
     s->stack_level_tab = js_malloc(ctx, sizeof(s->stack_level_tab[0]) *
                                    s->bc_len);
@@ -36885,7 +36894,10 @@ static __exception int compute_stack_size(JSContext *ctx,
     }
     js_free(ctx, s->pc_stack);
     js_free(ctx, s->catch_pos_tab);
-    js_free(ctx, s->stack_level_tab);
+    if (pstack_level_tab)
+        *pstack_level_tab = s->stack_level_tab;
+    else
+        js_free(ctx, s->stack_level_tab);
     *pstack_size = s->stack_len_max;
     return 0;
  fail:
@@ -36894,6 +36906,76 @@ static __exception int compute_stack_size(JSContext *ctx,
     js_free(ctx, s->stack_level_tab);
     *pstack_size = 0;
     return -1;
+}
+
+/* Name the callee in the "not a function" TypeError thrown by a failed
+   OP_call_method / OP_tail_call_method, e.g. o.foo() throws "foo is not
+   a function": the name is the atom of the last instruction that wrote
+   the callee's stack slot before the call, if it is an OP_get_field2.
+   Method calls are only emitted for callees produced by a property
+   access and the arguments evaluate above the callee on the stack, so
+   no other write can come in between; callees loaded some other way
+   (super/private/computed properties, `with`) keep the generic message.
+   Only ever runs on the error path. */
+static no_inline void js_improve_not_a_function_error(JSContext *ctx,
+                                                      JSStackFrame *sf,
+                                                      JSFunctionBytecode *b,
+                                                      const uint8_t *pc,
+                                                      JSValueConst *call_argv)
+{
+    const uint8_t *bc_buf = b->byte_code_buf;
+    const JSOpCode *oi;
+    JSObject *p;
+    uint16_t *depth_tab;
+    int pos, op, n_pop, depth, stack_size, call_pc, slot;
+    JSAtom name;
+    JSValue exc;
+
+    /* only when the exception is the callee failing the callability
+       check of JS_CallInternal(), i.e. it is not callable */
+    if (JS_VALUE_GET_TAG(call_argv[-1]) == JS_TAG_OBJECT) {
+        p = JS_VALUE_GET_OBJ(call_argv[-1]);
+        if (p->class_id == JS_CLASS_BYTECODE_FUNCTION ||
+            ctx->rt->class_array[p->class_id].call != NULL)
+            return;
+    }
+    call_pc = (int)(pc - 3 - bc_buf);
+    slot = (int)(call_argv - 1 - (sf->var_buf + b->var_count));
+    exc = JS_GetException(ctx);
+    if (JS_IsUncatchableError(exc))
+        goto restore; /* e.g. an interrupt: must stay uncatchable */
+    if (compute_stack_size(ctx, bc_buf, b->byte_code_len, &stack_size,
+                           &depth_tab)) {
+        JS_FreeValue(ctx, JS_GetException(ctx)); /* out of memory */
+        goto restore;
+    }
+    name = JS_ATOM_NULL;
+    for (pos = 0; pos < call_pc; pos += oi->size) {
+        op = bc_buf[pos];
+        if (op == 0 || op >= OP_COUNT)
+            break; /* cannot happen: verified by compute_stack_size() */
+        oi = &short_opcode_info(op);
+        depth = depth_tab[pos];
+        if (depth == 0xffff)
+            continue; /* not reachable */
+        n_pop = oi->n_pop;
+        if (oi->fmt == OP_FMT_npop || oi->fmt == OP_FMT_npop_u16)
+            n_pop += get_u16(bc_buf + pos + 1);
+        else if (oi->fmt == OP_FMT_npopx)
+            n_pop += op - OP_call0;
+        /* the instruction writes the slots it pushes */
+        if (depth - n_pop <= slot && slot < depth - n_pop + oi->n_push)
+            name = (op == OP_get_field2) ? get_u32(bc_buf + pos + 1)
+                                         : JS_ATOM_NULL;
+    }
+    js_free(ctx, depth_tab);
+    if (name != JS_ATOM_NULL) {
+        JS_FreeValue(ctx, exc);
+        JS_ThrowTypeErrorAtom(ctx, "%s is not a function", name);
+        return;
+    }
+restore:
+    JS_Throw(ctx, exc);
 }
 
 static int add_module_variables(JSContext *ctx, JSFunctionDef *fd)
@@ -37029,7 +37111,8 @@ static JSValue js_create_function(JSContext *ctx, JSFunctionDef *fd)
     if (resolve_labels(ctx, fd))
         goto fail;
 
-    if (compute_stack_size(ctx, fd, &stack_size) < 0)
+    if (compute_stack_size(ctx, fd->byte_code.buf, fd->byte_code.size,
+                           &stack_size, NULL) < 0)
         goto fail;
 
     function_size = sizeof(*b);

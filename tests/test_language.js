@@ -268,6 +268,26 @@ function test_constructor()
     assert(ex.message, "G is not a constructor")
 }
 
+function test_not_a_function()
+{
+    function expect(f, message) {
+        let ex
+        try { f() } catch (ex_) { ex = ex_ }
+        assert(ex instanceof TypeError)
+        assert(ex.message, message)
+    }
+    expect(() => { let o = {}; o.foo() }, "foo is not a function")
+    expect(() => { let a = {b: {c: 1}}; a.b.c() }, "c is not a function")
+    // nested method calls and interleaved property writes must not
+    // confuse it, tail calls must work too
+    expect(() => { let o = {f: 1, g: () => 1}; o.f(o.g()) }, "f is not a function")
+    expect(() => { let o = {f: 1}, a = {b: 2}; o.f(a.b += 1) }, "f is not a function")
+    expect(() => { "use strict"; let o = {f: 0}; return o.f() }, "f is not a function")
+    // no name: computed properties and non-method calls keep the old message
+    expect(() => { let o = {}; o["computed"]() }, "not a function")
+    expect(() => { let x = 42; x() }, "not a function")
+}
+
 function test_prototype()
 {
     var f = function f() { };
@@ -1089,6 +1109,7 @@ test_inc_dec();
 test_op2();
 test_delete();
 test_constructor();
+test_not_a_function();
 test_prototype();
 test_arguments();
 test_class();
